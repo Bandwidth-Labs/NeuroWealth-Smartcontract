@@ -1,5 +1,14 @@
 import { Account, Address, Contract, rpc, scValToNative, TransactionBuilder, xdr } from '@stellar/stellar-sdk';
 import { getBrowserTestHarness } from './browserTestHarness';
+import {
+  EMPTY_VAULT_STATE,
+  deriveVaultState,
+  shortenAddress as shortenSharedAddress,
+  type VaultState,
+} from '../../../packages/vault-client/src/stellar';
+
+export type { VaultState };
+export { EMPTY_VAULT_STATE };
 
 function requirePublicEnv(name: string): string {
   const value = process.env[name];
@@ -17,19 +26,6 @@ export const server = new rpc.Server(RPC_URL, {
   allowHttp: process.env.NEXT_PUBLIC_E2E_TESTS === 'true',
 });
 export const networkPassphrase = NETWORK_PASSPHRASE;
-
-export interface VaultState {
-  balance: number;
-  strategy: 'Conservative' | 'Balanced' | 'Growth';
-  exchangeRate: number;
-  apy: number;
-}
-
-const STRATEGY_MAP: Record<string, VaultState['strategy']> = {
-  conservative: 'Conservative',
-  balanced: 'Balanced',
-  growth: 'Growth',
-};
 
 export async function simulateContractCall(
   method: string,
@@ -58,7 +54,7 @@ export async function simulateContractCall(
 
 export async function fetchVaultState(userAddress?: string): Promise<VaultState> {
   if (!userAddress) {
-    return { balance: 0, strategy: 'Balanced', exchangeRate: 1.0, apy: 0 };
+    return { ...EMPTY_VAULT_STATE };
   }
 
   try {
@@ -72,26 +68,19 @@ export async function fetchVaultState(userAddress?: string): Promise<VaultState>
       simulateContractCall('get_total_shares', [], userAddress),
     ]);
 
-    const balance = balanceRes.status === 'fulfilled' ? Number(balanceRes.value) / 1e7 : 0;
-    const rawStrategy = strategyRes.status === 'fulfilled' ? String(strategyRes.value).toLowerCase() : '';
-    const strategy = STRATEGY_MAP[rawStrategy] || 'Balanced';
-    const exchangeRateRaw = exchangeRateRes.status === 'fulfilled' ? Number(exchangeRateRes.value) / 1e7 : 0;
-    const totalAssets = totalAssetsRes.status === 'fulfilled' ? Number(totalAssetsRes.value) / 1e7 : 0;
-    const totalShares = totalSharesRes.status === 'fulfilled' ? Number(totalSharesRes.value) / 1e7 : 0;
-
-    const exchangeRate = exchangeRateRaw > 0 ? exchangeRateRaw : (totalShares > 0 ? totalAssets / totalShares : 1.0);
-    const apy = totalAssets > 0 && totalShares > 0
-      ? Number((((totalAssets / totalShares - 1) * 365 * 100).toFixed(2)))
-      : 0;
-
-    return { balance, strategy, exchangeRate, apy };
+    return deriveVaultState({
+      balance: balanceRes.status === 'fulfilled' ? Number(balanceRes.value) / 1e7 : 0,
+      rawStrategy: strategyRes.status === 'fulfilled' ? String(strategyRes.value) : '',
+      exchangeRateRaw: exchangeRateRes.status === 'fulfilled' ? Number(exchangeRateRes.value) / 1e7 : 0,
+      totalAssets: totalAssetsRes.status === 'fulfilled' ? Number(totalAssetsRes.value) / 1e7 : 0,
+      totalShares: totalSharesRes.status === 'fulfilled' ? Number(totalSharesRes.value) / 1e7 : 0,
+    });
   } catch (err) {
     console.warn('Failed to fetch vault state from Soroban RPC:', err);
-    return { balance: 0, strategy: 'Balanced', exchangeRate: 1.0, apy: 0 };
+    return { ...EMPTY_VAULT_STATE };
   }
 }
 
 export function shortenAddress(address: string, chars = 4): string {
-  if (!address) return '';
-  return `${address.substring(0, chars + 2)}...${address.substring(address.length - chars)}`;
+  return shortenSharedAddress(address, chars);
 }

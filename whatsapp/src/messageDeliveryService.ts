@@ -1,6 +1,7 @@
 import pino from 'pino';
 import { query } from './db';
 import { hashPhoneNumber, encryptSecretKey, decryptSecretKey } from './cryptoUtils';
+import { boundProviderCallback } from './inputBounds';
 
 const logger = pino({ name: 'whatsapp-message-delivery' });
 
@@ -48,7 +49,7 @@ export interface DeliveryStatusCallback {
 
 export type ApplyResult =
   | { applied: true; created: boolean }
-  | { applied: false; reason: 'missing_message_sid' | 'unknown_status' | 'stale_status' };
+  | { applied: false; reason: 'missing_message_sid' | 'unknown_status' | 'stale_status' | 'rejected_input' };
 
 /**
  * Applies a Twilio delivery-status callback to the reconciliation ledger.
@@ -62,7 +63,13 @@ export type ApplyResult =
  * until Twilio assigns it after we've already responded.
  */
 export async function applyDeliveryStatus(callback: DeliveryStatusCallback): Promise<ApplyResult> {
-  const { messageSid, status, to, errorCode, errorMessage } = callback;
+  const bounded = boundProviderCallback(callback);
+  if (!bounded.ok) {
+    logger.warn({ field: bounded.field, reason: bounded.reason }, 'Rejecting delivery status callback outside input bounds');
+    return { applied: false, reason: 'rejected_input' };
+  }
+
+  const { messageSid, status, to, errorCode, errorMessage } = bounded.value;
 
   if (!messageSid) {
     logger.warn({ status, to }, 'Ignoring delivery status callback with no MessageSid');

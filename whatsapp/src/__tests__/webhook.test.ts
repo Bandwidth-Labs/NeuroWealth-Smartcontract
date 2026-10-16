@@ -15,6 +15,7 @@
 process.env.ENCRYPTION_KEY = 'test-encryption-key-at-least-32-chars!!';
 process.env.PHONE_HASH_SALT = 'test-phone-salt';
 process.env.VAULT_CONTRACT_ID = 'CTEST_VAULT';
+process.env.SOROBAN_RPC_URL = 'http://127.0.0.1:8000';
 
 // ── Stub twilio before webhook.ts loads it ──────────────────────────────────
 import path from 'node:path';
@@ -51,9 +52,49 @@ for (const key of [
   } catch { /* ignore resolve errors */ }
 }
 
+const wallets = new Map<string, {
+  public_key: string;
+  encrypted_data: string;
+  iv: string;
+  tag: string;
+  created_at: Date;
+}>();
+
+const dbPath = require.resolve('../db');
+require.cache[dbPath] = {
+  id: dbPath,
+  filename: dbPath,
+  loaded: true,
+  exports: {
+    query: async (sql: string, params: any[] = []) => {
+      if (sql.includes('INSERT INTO whatsapp_wallets')) {
+        if (!wallets.has(params[0])) {
+          wallets.set(params[0], {
+            public_key: params[1],
+            encrypted_data: params[2],
+            iv: params[3],
+            tag: params[4],
+            created_at: new Date(params[5]),
+          });
+        }
+        return { rows: [] };
+      }
+      if (sql.includes('FROM whatsapp_wallets')) {
+        const row = wallets.get(params[0]);
+        return { rows: row ? [row] : [] };
+      }
+      return { rows: [] };
+    },
+  },
+  parent: null,
+  children: [],
+  paths: [],
+} as any;
+
 import { test, describe, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleWhatsAppWebhook } from '../webhook';
+import { INPUT_LIMITS, SAFE_OVERSIZE_REPLY, SAFE_STRATEGY_REPLY, SAFE_MALFORMED_REPLY } from '../inputBounds';
 
 // ── Minimal req/res helpers ──────────────────────────────────────────────────
 
@@ -68,11 +109,12 @@ let lastStatus = 200;
 let lastBody = '';
 
 function makeRes() {
-  return {
-    type: (t: string) => { lastContentType = t; return res; },
-    send: (b: string) => { lastBody = b; return res; },
-    status: (s: number) => { lastStatus = s; return res; },
-  } as any;
+  const response: any = {
+    type: (t: string) => { lastContentType = t; return response; },
+    send: (b: string) => { lastBody = b; return response; },
+    status: (s: number) => { lastStatus = s; return response; },
+  };
+  return response;
 }
 
 let res: ReturnType<typeof makeRes>;
@@ -303,5 +345,82 @@ describe('webhook – error handling', () => {
     const badReq = { body: { From: `whatsapp:${phone}`, Body: 'balance' } } as any;
     // This should resolve (not throw) even if an error occurs internally
     await assert.doesNotReject(() => handleWhatsAppWebhook(badReq, makeRes()));
+  });
+});
+
+describe('webhook – input bounds (#876)', () => {
+  test('handles a body exactly at the limit and rejects one byte over', async () => {
+    const phone = nextPhone();
+    const exact = `hi${' '.repeat(INPUT_LIMITS.inboundBody - 2)}`;
+    assert.equal(Buffer.byteLength(exact), INPUT_LIMITS.inboundBody);
+    await handleWhatsAppWebhook(makeReq(phone, exact), makeRes());
+    assert.match(lastBody, /otp/i);
+    assert.doesNotMatch(lastBody, /too long/i);
+
+    const over = `hi${' '.repeat(INPUT_LIMITS.inboundBody - 1)}`;
+    assert.equal(Buffer.byteLength(over), INPUT_LIMITS.inboundBody + 1);
+    await handleWhatsAppWebhook(makeReq(phone, over), makeRes());
+    assert.match(lastBody, /too long/i);
+    assert.equal(lastBody.includes(over), false);
+    assert.doesNotMatch(lastBody, /otp/i);
+  });
+
+  test('handles a command exactly at the limit and rejects one byte over before deposit', async () => {
+    const phone = nextPhone();
+    const exact = 'a'.repeat(INPUT_LIMITS.commandText);
+    await handleWhatsAppWebhook(makeReq(phone, exact), makeRes());
+    assert.match(lastBody, /otp/i);
+    assert.equal(lastBody.includes(SAFE_OVERSIZE_REPLY), false);
+
+    const over = 'a'.repeat(INPUT_LIMITS.commandText + 1);
+    await handleWhatsAppWebhook(makeReq(nextPhone(), over), makeRes());
+    assert.equal(lastBody.includes(SAFE_OVERSIZE_REPLY), true);
+    assert.equal(lastBody.includes(over), false);
+    assert.doesNotMatch(lastBody, /deposited/i);
+  });
+
+  test('rejects an oversized deposit after verification without preparing a transaction', async () => {
+    const phone = nextPhone();
+    await fullVerify(phone);
+    const over = `deposit ${'9'.repeat(INPUT_LIMITS.commandText)}`;
+    await handleWhatsAppWebhook(makeReq(phone, over), makeRes());
+    assert.equal(lastBody.includes(SAFE_OVERSIZE_REPLY), true);
+    assert.doesNotMatch(lastBody, /deposited/i);
+    assert.equal(lastBody.includes(over), false);
+  });
+
+  test('handles a strategy name at the limit and rejects one byte over without echoing it', async () => {
+    const phone = nextPhone();
+    await fullVerify(phone);
+    const exactName = 'a'.repeat(INPUT_LIMITS.strategy);
+    await handleWhatsAppWebhook(makeReq(phone, `switch to ${exactName}`), makeRes());
+    assert.match(lastBody, new RegExp(exactName));
+
+    const overName = 'b'.repeat(INPUT_LIMITS.strategy + 1);
+    await handleWhatsAppWebhook(makeReq(phone, `switch to ${overName}`), makeRes());
+    assert.equal(lastBody.includes(SAFE_STRATEGY_REPLY), true);
+    assert.equal(lastBody.includes(overName), false);
+  });
+
+  test('rejects a malformed body without echoing it', async () => {
+    const phone = nextPhone();
+    const malformed = `hi\uD800`;
+    await handleWhatsAppWebhook(makeReq(phone, malformed), makeRes());
+    assert.equal(lastBody.includes(SAFE_MALFORMED_REPLY), true);
+    assert.equal(lastBody.includes('\uD800'), false);
+    assert.doesNotMatch(lastBody, /otp/i);
+  });
+
+  test('rejects a sender one byte over the address limit', async () => {
+    const exactFrom = `whatsapp:${'1'.repeat(INPUT_LIMITS.address - 'whatsapp:'.length)}`;
+    assert.equal(Buffer.byteLength(exactFrom), INPUT_LIMITS.address);
+    await handleWhatsAppWebhook({ body: { From: exactFrom, Body: 'hi' } } as any, makeRes());
+    assert.match(lastBody, /otp/i);
+
+    const overFrom = `${exactFrom}1`;
+    await handleWhatsAppWebhook({ body: { From: overFrom, Body: 'hi' } } as any, makeRes());
+    assert.equal(lastBody.includes(SAFE_OVERSIZE_REPLY), true);
+    assert.equal(lastBody.includes(overFrom), false);
+    assert.doesNotMatch(lastBody, /otp/i);
   });
 });

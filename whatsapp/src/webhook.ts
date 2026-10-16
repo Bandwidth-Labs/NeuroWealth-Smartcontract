@@ -12,6 +12,24 @@ import { createCustodialWallet, getWallet } from './walletService';
 import { parseIntent } from './intentParser';
 import { validateIntent } from './contractLimits';
 import { getPortfolio, handleDeposit, handleWithdraw, handleStrategyUpdate } from './vaultRouter';
+import {
+  INPUT_LIMITS,
+  SAFE_MALFORMED_REPLY,
+  SAFE_OVERSIZE_REPLY,
+  SAFE_STRATEGY_REPLY,
+  boundOutbound,
+  boundText,
+} from './inputBounds';
+
+function reply(twiml: { message: (body: string) => unknown }, text: string): void {
+  twiml.message(boundOutbound(text));
+}
+
+function rejectInbound(res: Response, reason: 'oversize' | 'malformed' | 'type'): void {
+  const twiml = new MessagingResponse();
+  reply(twiml, reason === 'oversize' ? SAFE_OVERSIZE_REPLY : SAFE_MALFORMED_REPLY);
+  res.type('text/xml').send(twiml.toString());
+}
 
 const MessagingResponse = twilio.twiml.MessagingResponse;
 
@@ -19,22 +37,40 @@ const MessagingResponse = twilio.twiml.MessagingResponse;
  * Main Webhook Handler for WhatsApp Messages (Twilio HTTP POST)
  */
 export async function handleWhatsAppWebhook(req: Request, res: Response): Promise<void> {
-  const fromNumber = req.body.From || ''; // E.164 format: whatsapp:+1234567890
-  const messageBody = req.body.Body || '';
+  const fromNumber = req.body?.From;
+  const messageBody = req.body?.Body;
 
-  if (!fromNumber) {
+  if (fromNumber === undefined || fromNumber === null || fromNumber === '') {
     res.status(400).send('Missing sender phone number');
     return;
   }
 
+  const fromCheck = boundText(fromNumber, INPUT_LIMITS.address);
+  if (!fromCheck.ok) {
+    rejectInbound(res, fromCheck.reason);
+    return;
+  }
+
+  const bodyCheck = boundText(messageBody ?? '', INPUT_LIMITS.inboundBody);
+  if (!bodyCheck.ok) {
+    rejectInbound(res, bodyCheck.reason);
+    return;
+  }
+
+  const commandCheck = boundText(bodyCheck.value.trim(), INPUT_LIMITS.commandText);
+  if (!commandCheck.ok) {
+    rejectInbound(res, commandCheck.reason);
+    return;
+  }
+
   // Hash PII (phone number) at rest
-  const phoneHash = hashPhoneNumber(fromNumber);
+  const phoneHash = hashPhoneNumber(fromCheck.value);
 
   // Every command below reads and mutates this user's shared session, OTP,
   // strategy, and transaction state. Serialize per phone number so
   // concurrent messages from the same user apply in arrival order instead
   // of racing; messages from different users still process in parallel.
-  await runExclusive(phoneHash, () => processWhatsAppMessage(phoneHash, messageBody, res));
+  await runExclusive(phoneHash, () => processWhatsAppMessage(phoneHash, commandCheck.value, res));
 }
 
 async function processWhatsAppMessage(phoneHash: string, messageBody: string, res: Response): Promise<void> {
@@ -42,7 +78,7 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
 
   // Enforce per-phone rate limiting
   if (!checkRateLimit(phoneHash)) {
-    twiml.message('⚠️ Rate limit exceeded. Please wait a minute before sending another message.');
+    reply(twiml, '⚠️ Rate limit exceeded. Please wait a minute before sending another message.');
     res.type('text/xml').send(twiml.toString());
     return;
   }
@@ -50,6 +86,15 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
   // Get or restore user session
   const session = getSession(phoneHash);
   const intent = parseIntent(messageBody);
+
+  if (intent.strategy) {
+    const strategyCheck = boundText(intent.strategy, INPUT_LIMITS.strategy);
+    if (!strategyCheck.ok) {
+      reply(twiml, SAFE_STRATEGY_REPLY);
+      res.type('text/xml').send(twiml.toString());
+      return;
+    }
+  }
 
   try {
     // STATE MACHINE FLOW:
@@ -61,11 +106,11 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
 
         // In production, Twilio SMS/WhatsApp sends this OTP code.
         // For testing/mocking, we include instructions in response.
-        twiml.message(
+        reply(twiml, 
           `👋 Welcome to NeuroWealth AI!\n\nTo secure your wallet, please enter your 6-digit OTP verification code.\n\n🔑 Your OTP code is: ${otpCode}\n(Code expires in 5 minutes)`
         );
       } else {
-        twiml.message('Welcome to NeuroWealth! Send "hi" to begin account verification.');
+        reply(twiml, 'Welcome to NeuroWealth! Send "hi" to begin account verification.');
       }
       res.type('text/xml').send(twiml.toString());
       return;
@@ -80,7 +125,7 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
           updateState(phoneHash, UserState.VERIFIED);
           const wallet = await createCustodialWallet(phoneHash);
 
-          twiml.message(
+          reply(twiml, 
             `✅ Phone number verified!\n\n` +
             `🔒 Created your secure custodial Stellar wallet:\n` +
             `Public Key: ${wallet.publicKey.substring(0, 8)}...${wallet.publicKey.substring(wallet.publicKey.length - 8)}\n\n` +
@@ -91,10 +136,10 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
             `• "switch to growth"`
           );
         } else {
-          twiml.message(`❌ ${verification.message}`);
+          reply(twiml, `❌ ${verification.message}`);
         }
       } else {
-        twiml.message('Please enter the 6-digit verification code sent to your phone (valid for 5 minutes).');
+        reply(twiml, 'Please enter the 6-digit verification code sent to your phone (valid for 5 minutes).');
       }
       res.type('text/xml').send(twiml.toString());
       return;
@@ -106,7 +151,7 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
       if (!wallet) {
         // Fallback state sync
         updateState(phoneHash, UserState.UNVERIFIED);
-        twiml.message('Session expired. Please send "hi" to start verification.');
+        reply(twiml, 'Session expired. Please send "hi" to start verification.');
         res.type('text/xml').send(twiml.toString());
         return;
       }
@@ -115,14 +160,14 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
       // before building any transaction.
       const validation = validateIntent(intent);
       if (!validation.ok) {
-        twiml.message(`⚠️ ${validation.error}`);
+        reply(twiml, `⚠️ ${validation.error}`);
         res.type('text/xml').send(twiml.toString());
         return;
       }
 
       switch (intent.type) {
         case 'GREETING': {
-          twiml.message(
+          reply(twiml, 
             `🤖 Hi! I'm your NeuroWealth AI Agent.\n\n` +
             `How can I assist your portfolio today?\n` +
             `1. "balance" - View current portfolio\n` +
@@ -137,7 +182,7 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
         case 'EARNINGS':
         case 'APY': {
           const portfolio = await getPortfolio(phoneHash);
-          twiml.message(
+          reply(twiml, 
             `💰 Your NeuroWealth Portfolio\n\n` +
             `Balance: ${portfolio.balance.toFixed(2)} USDC ($${portfolio.usdEquivalent.toFixed(2)})\n` +
             `Earnings today: +$${portfolio.dailyEarnings.toFixed(2)}\n` +
@@ -149,28 +194,28 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
 
         case 'DEPOSIT': {
           const result = await handleDeposit(phoneHash, intent.amount as number, intent.strategy);
-          twiml.message(`🤖 ${result.message}`);
+          reply(twiml, `🤖 ${result.message}`);
           break;
         }
 
         case 'WITHDRAW': {
           const result = await handleWithdraw(phoneHash, intent.amount, intent.withdrawAll);
-          twiml.message(`🤖 ${result.message}`);
+          reply(twiml, `🤖 ${result.message}`);
           break;
         }
 
         case 'STRATEGY': {
           if (!intent.strategy) {
-            twiml.message('❌ Please specify a valid strategy.');
+            reply(twiml, '❌ Please specify a valid strategy.');
             break;
           }
           const result = await handleStrategyUpdate(phoneHash, intent.strategy);
-          twiml.message(result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
+          reply(twiml, result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
           break;
         }
 
         default: {
-          twiml.message(
+          reply(twiml, 
             `I didn't quite catch that. Try commands like:\n` +
             `• "deposit 50 USDC"\n` +
             `• "what's my balance"\n` +
@@ -187,7 +232,7 @@ async function processWhatsAppMessage(phoneHash: string, messageBody: string, re
       { error, phoneHash, intent, state: session.state, reqId },
       'Error processing webhook request'
     );
-    twiml.message(`❌ An error occurred processing your request. Please try again in a few moments. (Ref: ${reqId})`);
+    reply(twiml, `❌ An error occurred processing your request. Please try again in a few moments. (Ref: ${reqId})`);
   }
 
   res.type('text/xml').send(twiml.toString());

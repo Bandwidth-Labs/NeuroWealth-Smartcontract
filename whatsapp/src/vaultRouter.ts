@@ -1,5 +1,11 @@
 import { Address, rpc, scValToNative } from '@stellar/stellar-sdk';
 import { getWallet } from './walletService';
+import { INPUT_LIMITS, SAFE_OVERSIZE_REPLY, boundText } from './inputBounds';
+
+function rejectUnusableAddress(publicKey: string): string | null {
+  const checked = boundText(publicKey, INPUT_LIMITS.address);
+  return checked.ok ? null : SAFE_OVERSIZE_REPLY;
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -35,10 +41,9 @@ export async function getPortfolio(phoneHash: string): Promise<UserPortfolio> {
     throw new Error('Wallet not found');
   }
 
-  const server = new rpc.Server(SOROBAN_RPC_URL);
-  const address = new Address(wallet.publicKey);
-
   try {
+    const server = new rpc.Server(SOROBAN_RPC_URL);
+    const address = new Address(wallet.publicKey);
     const [balanceRes, strategyRes, exchangeRateRes, totalAssetsRes, totalSharesRes] = await Promise.all([
       server.simulateContractInvocation({
         contractAddress: VAULT_CONTRACT_ID,
@@ -110,6 +115,10 @@ export async function handleDeposit(
   if (!wallet) {
     return { success: false, txHash: '', message: 'Wallet not initialized.' };
   }
+  const addressError = rejectUnusableAddress(wallet.publicKey);
+  if (addressError) {
+    return { success: false, txHash: '', message: addressError };
+  }
 
   const selectedStrategy = strategy || 'Balanced';
   const txHash = `0x${Buffer.from(Math.random().toString()).toString('hex').substring(0, 64)}`;
@@ -133,6 +142,10 @@ export async function handleWithdraw(
   if (!wallet) {
     return { success: false, txHash: '', message: 'Wallet not initialized.' };
   }
+  const addressError = rejectUnusableAddress(wallet.publicKey);
+  if (addressError) {
+    return { success: false, txHash: '', message: addressError };
+  }
 
   const withdrawAmountText = withdrawAll ? 'all funds' : `${amount} USDC`;
   const txHash = `0x${Buffer.from(Math.random().toString()).toString('hex').substring(0, 64)}`;
@@ -154,6 +167,10 @@ export async function handleStrategyUpdate(
   const wallet = await getWallet(phoneHash);
   if (!wallet) {
     return { success: false, txHash: '', message: 'Wallet not initialized.' };
+  }
+  const addressError = rejectUnusableAddress(wallet.publicKey);
+  if (addressError) {
+    return { success: false, txHash: '', message: addressError };
   }
 
   if (strategy.toUpperCase() === 'INVALID') {
