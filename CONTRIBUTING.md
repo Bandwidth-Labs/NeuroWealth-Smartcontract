@@ -304,6 +304,20 @@ Occasionally a state-changing function is intentionally permissionless (for exam
 
 Both methods cause the gate to skip that function. Reserve this escape hatch for functions that genuinely have no meaningful access-control boundary — all owner-only, agent-only, and user-scoped functions must have a SECURITY.md row.
 
+### Soroban Pitfall Lints
+
+`scripts/check-soroban-lints.py` (run in the **Security Documentation Audit** CI job) parses the production vault sources and fails on three Soroban pitfalls:
+
+| Rule | Flags |
+|------|-------|
+| `unwrap-storage-get` | `env.storage().<tier>().get(..).unwrap()` / `.expect(..)` — a missing key aborts with an opaque host panic instead of a typed `VaultError`. Use `.unwrap_or(..)` or `.unwrap_or_else(\|\| panic_with_error!(..))`. |
+| `missing-require-initialized` | A `#[contractimpl]` `pub fn` that never reaches `require_initialized` (directly or through helpers like `require_is_owner`). |
+| `missing-require-auth` | A `#[contractimpl]` `pub fn` that writes storage or moves tokens (directly or through helpers) without reaching `require_auth` / `require_auth_for_args`. |
+
+Run it locally with `python3 scripts/check-soroban-lints.py`. To suppress a finding, either add `// soroban-lint: allow(<rule>) <reason>` on the offending line (or directly above the `pub fn`), or add the function with a justification to [`scripts/soroban-lints-allow.json`](scripts/soroban-lints-allow.json).
+
+Pre-existing storage unwraps are tracked as a per-function ratchet baseline in the same file: adding a new one fails CI, and removing one asks you to lower the count via `python3 scripts/check-soroban-lints.py --update-baseline`. Never raise a baseline count to make CI pass.
+
 ### Dependency Audit & Advisory Exceptions
 
 The dependency audit ([`EmbarkStudios/cargo-deny-action`](https://github.com/EmbarkStudios/cargo-deny-action)) enforces the license, advisory, and source policies defined in [`deny.toml`](deny.toml). To reproduce it locally:

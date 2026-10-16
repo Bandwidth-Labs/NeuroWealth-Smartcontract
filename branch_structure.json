@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/soroban-pitfall-lints",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/soroban-pitfall-lints": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/soroban-pitfall-lints",
+    "origin"
+  ]
+}

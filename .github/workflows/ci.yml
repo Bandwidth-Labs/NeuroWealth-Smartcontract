@@ -479,6 +479,9 @@ jobs:
       - name: Verify auth matrix against source (lib.rs)
         run: python3 scripts/check-auth-matrix.py
 
+      - name: Soroban pitfall lints (storage unwrap / init / auth)
+        run: python3 scripts/check-soroban-lints.py
+
       - name: Verify DataKey::Balance deprecation
         run: bash scripts/check-balance-deprecation.sh
 
